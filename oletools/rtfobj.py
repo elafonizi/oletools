@@ -59,6 +59,9 @@ http://www.decalage.info/python/oletools
 # 2016-07-19       PL: - fixed Python 2.6-2.7 support
 # 2016-07-30       PL: - new API with class RtfObject
 #                      - backward-compatible API rtf_iter_objects (fixed issue #70)
+# 2016-07-31       PL: - table output with tablestream
+# 2016-08-01       PL: - detect executable filenames in OLE Package
+# 2016-08-08       PL: - added option -s to save objects to files
 
 __version__ = '0.50'
 
@@ -66,15 +69,22 @@ __version__ = '0.50'
 # TODO:
 # - allow semicolon within hex, as found in  this sample:
 #   http://contagiodump.blogspot.nl/2011/10/sep-28-cve-2010-3333-manuscript-with.html
+# TODO: use OleObject and OleNativeStream in RtfObject instead of copying each attribute
+# TODO: option -e <id> to extract an object, -e all for all objects
+# TODO: option to choose which destinations to include (objdata by default)
+# TODO: option to display SHA256 or MD5 hashes of objects in table
 
 
 # === IMPORTS =================================================================
 
 import re, os, sys, binascii, logging, optparse
+import os.path
 
 from thirdparty.xglob import xglob
 from oleobj import OleObject, OleNativeStream
 import oleobj
+
+from thirdparty.tablestream import tablestream
 
 
 # === LOGGING =================================================================
@@ -215,6 +225,10 @@ DECIMAL_GROUP = b'(\d{1,250})'
 re_delims_bin_decimal = re.compile(DELIMITERS_ZeroOrMore + BACKSLASH_BIN
                                    + DECIMAL_GROUP + DELIMITER)
 re_delim_hexblock = re.compile(DELIMITER + PATTERN)
+
+# TODO: use a frozenset instead of a regex?
+re_executable_extensions = re.compile(
+    r"(?i)\.(EXE|COM|PIF|GADGET|MSI|MSP|MSC|VBS|VBE|VB|JSE|JS|WSF|WSC|WSH|WS|BAT|CMD|DLL|SCR|HTA|CPL|CLASS|JAR|PS1XML|PS1|PS2XML|PS2|PSC1|PSC2|SCF|LNK|INF|REG)\b")
 
 # Destination Control Words, according to MS RTF Specifications v1.9.1:
 DESTINATION_CONTROL_WORDS = frozenset((
@@ -542,7 +556,7 @@ class RtfObjParser(RtfParser):
                     rtfobj.is_package = True
             except:
                 pass
-                log.exception('*** Not an OLE 1.0 Object')
+                log.debug('*** Not an OLE 1.0 Object')
 
     def bin(self, bindata):
         if self.current_destination.cword == 'objdata':
@@ -600,7 +614,7 @@ def sanitize_filename(filename, replacement='_', max_length=200):
     return sane_fname
 
 
-def process_file(container, filename, data, output_dir=None):
+def process_file(container, filename, data, output_dir=None, save_object=False):
     if output_dir:
         if not os.path.isdir(output_dir):
             log.info('creating output directory %s' % output_dir)
@@ -617,49 +631,90 @@ def process_file(container, filename, data, output_dir=None):
     if data is None:
         data = open(filename, 'rb').read()
     print('='*79)
-    print('File: %r - %d bytes' % (filename, len(data)))
+    print('File: %r - size: %d bytes' % (filename, len(data)))
+    tstream = tablestream.TableStream(
+        column_width=(3, 10, 31, 31),
+        header_row=('id', 'index', 'OLE Object', 'OLE Package'),
+        style=tablestream.TableStyleSlim
+    )
     rtfp = RtfObjParser(data)
     rtfp.parse()
     for rtfobj in rtfp.objects:
-        print('-'*79)
-        print('found object size %d at index %08X - end %08X'
-            % (len(rtfobj.rawdata), rtfobj.start, rtfobj.end))
-        fname = '%s_object_%08X.raw' % (fname_prefix, rtfobj.start)
-        print('saving object to file %s' % fname)
-        open(fname, 'wb').write(rtfobj.rawdata)
+        pkg_color = None
         if rtfobj.is_ole:
-            print('extract file embedded in OLE object:')
-            print('format_id  = %d' % rtfobj.format_id)
-            print('class name = %r' % rtfobj.class_name)
-            print('data size  = %d' % rtfobj.oledata_size)
-            # set a file extension according to the class name:
-            class_name = rtfobj.class_name.lower()
-            if class_name.startswith(b'word'):
-                ext = 'doc'
-            elif class_name.startswith(b'package'):
-                ext = 'package'
-            else:
-                ext = 'bin'
-            fname = '%s_object_%08X.%s' % (fname_prefix, rtfobj.start, ext)
-            print('saving to file %s' % fname)
-            open(fname, 'wb').write(rtfobj.oledata)
+            ole_column = 'format_id: %d\n' % rtfobj.format_id
+            ole_column += 'class name: %r\n' % rtfobj.class_name
+            ole_column += 'data size: %d' % rtfobj.oledata_size
             if rtfobj.is_package:
-                print('Parsing OLE Package')
-                print('Filename = %r' % rtfobj.filename)
-                print('Source path = %r' % rtfobj.src_path)
-                print('Temp path = %r' % rtfobj.temp_path)
+                pkg_column = 'Filename: %r\n' % rtfobj.filename
+                pkg_column += 'Source path: %r\n' % rtfobj.src_path
+                pkg_column += 'Temp path = %r' % rtfobj.temp_path
+                pkg_color = 'yellow'
+                # check if the file extension is executable:
+                _, ext = os.path.splitext(rtfobj.filename)
+                log.debug('File extension: %r' % ext)
+                if re_executable_extensions.match(ext):
+                    pkg_color = 'red'
+                    pkg_column += '\nEXECUTABLE FILE'
+            else:
+                pkg_column = 'Not an OLE Package'
+        else:
+            pkg_column = ''
+            ole_column = 'Not a well-formed OLE object'
+        tstream.write_row((
+            rtfp.objects.index(rtfobj),
+            # filename,
+            '%08Xh' % rtfobj.start,
+            ole_column,
+            pkg_column
+            ), colors=(None, None, None, pkg_color)
+        )
+        tstream.write_sep()
+    if save_object:
+        if save_object == 'all':
+            objects = rtfp.objects
+        else:
+            try:
+                i = int(save_object)
+                objects = [ rtfp.objects[i] ]
+            except:
+                log.error('The -s option must be followed by an object index or all, such as "-s 2" or "-s all"')
+                return
+        for rtfobj in objects:
+            i = objects.index(rtfobj)
+            if rtfobj.is_package:
+                print('Saving file from OLE Package in object #%d:' % i)
+                print('  Filename = %r' % rtfobj.filename)
+                print('  Source path = %r' % rtfobj.src_path)
+                print('  Temp path = %r' % rtfobj.temp_path)
                 if rtfobj.filename:
                     fname = '%s_%s' % (fname_prefix,
                                        sanitize_filename(rtfobj.filename))
                 else:
                     fname = '%s_object_%08X.noname' % (fname_prefix, rtfobj.start)
-                print('saving to file %s' % fname)
+                print('  saving to file %s' % fname)
                 open(fname, 'wb').write(rtfobj.olepkgdata)
+            elif rtfobj.is_ole:
+                print('Saving file embedded in OLE object #%d:' % i)
+                print('  format_id  = %d' % rtfobj.format_id)
+                print('  class name = %r' % rtfobj.class_name)
+                print('  data size  = %d' % rtfobj.oledata_size)
+                # set a file extension according to the class name:
+                class_name = rtfobj.class_name.lower()
+                if class_name.startswith(b'word'):
+                    ext = 'doc'
+                elif class_name.startswith(b'package'):
+                    ext = 'package'
+                else:
+                    ext = 'bin'
+                fname = '%s_object_%08X.%s' % (fname_prefix, rtfobj.start, ext)
+                print('  saving to file %s' % fname)
+                open(fname, 'wb').write(rtfobj.oledata)
             else:
-                print('Not an OLE Package')
-        else:
-            print('Not a well-formed OLE object')
-
+                print('Saving raw data in object #%d:' % i)
+                fname = '%s_object_%08X.raw' % (fname_prefix, rtfobj.start)
+                print('  saving object to file %s' % fname)
+                open(fname, 'wb').write(rtfobj.rawdata)
 
 
 #=== MAIN =================================================================
@@ -688,14 +743,27 @@ def main():
     #     help='export results to a CSV file')
     parser.add_option("-r", action="store_true", dest="recursive",
         help='find files recursively in subdirectories.')
-    parser.add_option("-d", type="str", dest="output_dir",
-        help='use specified directory to output files.', default=None)
     parser.add_option("-z", "--zip", dest='zip_password', type='str', default=None,
         help='if the file is a zip archive, open first file from it, using the provided password (requires Python 2.6+)')
     parser.add_option("-f", "--zipfname", dest='zip_fname', type='str', default='*',
         help='if the file is a zip archive, file(s) to be opened within the zip. Wildcards * and ? are supported. (default:*)')
     parser.add_option('-l', '--loglevel', dest="loglevel", action="store", default=DEFAULT_LOG_LEVEL,
                             help="logging level debug/info/warning/error/critical (default=%default)")
+    parser.add_option("-s", "--save", dest='save_object', type='str', default=None,
+        help='Save the object corresponding to the provided number to a file, for example "-s 2". Use "-s all" to save all objects at once.')
+    # parser.add_option("-o", "--outfile", dest='outfile', type='str', default=None,
+    #     help='Filename to be used when saving an object to a file.')
+    parser.add_option("-d", type="str", dest="output_dir",
+        help='use specified directory to save output files.', default=None)
+    # parser.add_option("--pkg", action="store_true", dest="save_pkg",
+    #     help='Save OLE Package binary data of extracted objects (file embedded into an OLE Package).')
+    # parser.add_option("--ole", action="store_true", dest="save_ole",
+    #     help='Save OLE binary data of extracted objects (object data without the OLE container).')
+    # parser.add_option("--raw", action="store_true", dest="save_raw",
+    #     help='Save raw binary data of extracted objects (decoded from hex, including the OLE container).')
+    # parser.add_option("--hex", action="store_true", dest="save_hex",
+    #     help='Save raw hexadecimal data of extracted objects (including the OLE container).')
+
 
     (options, args) = parser.parse_args()
 
@@ -714,13 +782,13 @@ def main():
     log.setLevel(logging.NOTSET)
     oleobj.log.setLevel(logging.NOTSET)
 
-
     for container, filename, data in xglob.iter_files(args, recursive=options.recursive,
         zip_password=options.zip_password, zip_fname=options.zip_fname):
         # ignore directory names stored in zip files:
         if container and filename.endswith('/'):
             continue
-        process_file(container, filename, data, options.output_dir)
+        process_file(container, filename, data, output_dir=options.output_dir,
+                     save_object=options.save_object)
 
 
 if __name__ == '__main__':
